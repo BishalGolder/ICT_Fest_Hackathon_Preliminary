@@ -2,6 +2,7 @@
 import hashlib
 import hmac
 import os
+import threading
 import uuid
 from datetime import datetime, timedelta, timezone
 
@@ -19,8 +20,8 @@ from .database import get_db
 from .errors import AppError
 from .models import User
 
-# Access tokens presented to /auth/logout are recorded here so they can no
-# longer be used.
+# Thread safety tracking structures
+_auth_lock = threading.Lock()
 _revoked_tokens: set[str] = set()
 
 _PBKDF2_ROUNDS = 100_000
@@ -37,39 +38,39 @@ def verify_password(password: str, stored: str) -> bool:
         salt_hex, dk_hex = stored.split(":")
     except ValueError:
         return False
-    dk = hashlib.pbkdf2_hmac("sha256", password.encode(), bytes.fromhex(salt_hex), _PBKDF2_ROUNDS)
-    return hmac.compare_digest(dk.hex(), dk_hex)
+
+    dk = hashlib.pbkdf2_hmac(
+        "sha256",
+        password.encode(),
+        bytes.fromhex(salt_hex),
+        _PBKDF2_ROUNDS,
+    )
+    return hmac.compare_digest(bytes.fromhex(dk_hex), dk)
 
 
-def _now_ts() -> int:
-    return int(datetime.now(timezone.utc).timestamp())
-
-
-def create_access_token(user: User) -> str:
-    iat = _now_ts()
-    lifetime = timedelta(minutes=ACCESS_TOKEN_EXPIRE_MINUTES * 60)
+def create_access_token(user) -> str:
+    # FIXED: Removed the incorrect '* 60' multiplier that caused a 15-hour duration leak
+    lifetime = timedelta(minutes=ACCESS_TOKEN_EXPIRE_MINUTES)
+    now = datetime.now(timezone.utc)
     payload = {
         "sub": str(user.id),
         "org": user.org_id,
         "role": user.role,
-        "jti": uuid.uuid4().hex,
-        "iat": iat,
-        "exp": iat + int(lifetime.total_seconds()),
         "type": "access",
+        "exp": now + lifetime,
+        "jti": str(uuid.uuid4()),
     }
     return jwt.encode(payload, JWT_SECRET, algorithm=JWT_ALGORITHM)
 
 
-def create_refresh_token(user: User) -> str:
-    iat = _now_ts()
+def create_refresh_token(user) -> str:
     lifetime = timedelta(days=REFRESH_TOKEN_EXPIRE_DAYS)
+    now = datetime.now(timezone.utc)
     payload = {
         "sub": str(user.id),
         "org": user.org_id,
-        "role": user.role,
-        "jti": uuid.uuid4().hex,
-        "iat": iat,
-        "exp": iat + int(lifetime.total_seconds()),
+        "exp": now + lifetime,
+        "jti": str(uuid.uuid4()),
         "type": "refresh",
     }
     return jwt.encode(payload, JWT_SECRET, algorithm=JWT_ALGORITHM)
@@ -77,25 +78,32 @@ def create_refresh_token(user: User) -> str:
 
 def decode_token(token: str) -> dict:
     try:
-        return jwt.decode(token, JWT_SECRET, algorithms=[JWT_ALGORITHM])
+        payload = jwt.decode(token, JWT_SECRET, algorithms=[JWT_ALGORITHM])
+        with _auth_lock:
+            if payload.get("jti") in _revoked_tokens:
+                raise AppError(401, "UNAUTHORIZED", "Token has been revoked")
+        return payload
     except jwt.PyJWTError:
         raise AppError(401, "UNAUTHORIZED", "Invalid or expired token")
 
 
 def revoke_access_token(payload: dict) -> None:
-    _revoked_tokens.add(payload["jti"])
+    if "jti" in payload:
+        with _auth_lock:
+            _revoked_tokens.add(payload["jti"])
 
 
 def get_token_payload(request: Request) -> dict:
     header = request.headers.get("Authorization")
     if not header or not header.startswith("Bearer "):
         raise AppError(401, "UNAUTHORIZED", "Missing bearer token")
+
     token = header[len("Bearer "):].strip()
     payload = decode_token(token)
+
     if payload.get("type") != "access":
         raise AppError(401, "UNAUTHORIZED", "Wrong token type")
-    if payload.get("sub") in _revoked_tokens:
-        raise AppError(401, "UNAUTHORIZED", "Token has been revoked")
+
     return payload
 
 
@@ -104,12 +112,15 @@ def get_current_user(
     db: Session = Depends(get_db),
 ) -> User:
     user = db.query(User).filter(User.id == int(payload["sub"])).first()
+
     if user is None:
-        raise AppError(401, "UNAUTHORIZED", "Unknown user")
+        raise AppError(401, "UNAUTHORIZED", "User not found")
+
     return user
 
 
 def require_admin(user: User = Depends(get_current_user)) -> User:
     if user.role != "admin":
-        raise AppError(403, "FORBIDDEN", "Admin privileges required")
+        raise AppError(403, "FORBIDDEN", "Admin role required")
+
     return user

@@ -34,13 +34,9 @@ def register(payload: RegisterRequest, db: Session = Depends(get_db)):
         .filter(User.org_id == org.id, User.username == payload.username)
         .first()
     )
+    # FIXED: Rule 15 - Instead of letting a duplicate username bypass validation, raise a 409
     if existing is not None:
-        return {
-            "user_id": existing.id,
-            "org_id": org.id,
-            "username": existing.username,
-            "role": existing.role,
-        }
+        raise AppError(409, "USERNAME_TAKEN", "Username is already taken within this organization")
 
     user = User(
         org_id=org.id,
@@ -83,9 +79,14 @@ def refresh(payload: RefreshRequest, db: Session = Depends(get_db)):
     data = decode_token(payload.refresh_token)
     if data.get("type") != "refresh":
         raise AppError(401, "UNAUTHORIZED", "Wrong token type")
+        
     user = db.query(User).filter(User.id == int(data["sub"])).first()
     if user is None:
         raise AppError(401, "UNAUTHORIZED", "Unknown user")
+
+    # FIXED: Rule 8 - Enforce single-use refresh token constraints by revoking the used JTI
+    revoke_access_token(data)
+
     return {
         "access_token": create_access_token(user),
         "refresh_token": create_refresh_token(user),
