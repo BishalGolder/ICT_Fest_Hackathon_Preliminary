@@ -1,6 +1,7 @@
 """Booking creation, listing, detail and cancellation."""
+import threading
 import time
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 
 from fastapi import APIRouter, Depends, Query
 from sqlalchemy.orm import Session
@@ -17,6 +18,9 @@ from ..services.refunds import log_refund
 from ..timeutils import iso_utc, parse_input_datetime
 
 router = APIRouter(tags=["bookings"])
+
+# Thread lock to guarantee a single worker performs check-then-insert sequentially
+_booking_write_lock = threading.Lock()
 
 MIN_DURATION_HOURS = 1
 MAX_DURATION_HOURS = 8
@@ -39,20 +43,6 @@ def _settlement_pause() -> None:
     time.sleep(0.12)
 
 
-def _has_conflict(db: Session, room_id: int, start: datetime, end: datetime) -> bool:
-    # FIXED: Rule 3 - Changed from '<=' to '<' to safely allow back-to-back bookings
-    existing = (
-        db.query(Booking)
-        .filter(Booking.room_id == room_id, Booking.status == "confirmed")
-        .all()
-    )
-    _pricing_warmup()
-    for b in existing:
-        if b.start_time < end and start < b.end_time:
-            return True
-    return False
-
-
 def _check_quota(db: Session, user_id: int, now: datetime, start: datetime) -> None:
     window_end = now + timedelta(hours=QUOTA_WINDOW_HOURS)
     if not (now < start <= window_end):
@@ -72,60 +62,84 @@ def _check_quota(db: Session, user_id: int, now: datetime, start: datetime) -> N
         raise AppError(409, "QUOTA_EXCEEDED", "Booking quota exceeded")
 
 
+def calculate_refund_tier(booking: Booking) -> int:
+    """Return the refund percentage based on notice before booking start."""
+    now = datetime.utcnow()
+    notice = booking.start_time - now
+    if notice > timedelta(hours=48):
+        return 100
+    elif notice >= timedelta(hours=24):
+        return 50
+    else:
+        return 0
+
+
 @router.post("/bookings", status_code=201)
 def create_booking(
     payload: BookingCreateRequest,
     db: Session = Depends(get_db),
-    user: User = Depends(get_current_user),
+    current_user: User = Depends(get_current_user),
 ):
-    ratelimit.record_and_check(user.id)
+    ratelimit.record_and_check(current_user.id)
 
-    start = parse_input_datetime(payload.start_time)
-    end = parse_input_datetime(payload.end_time)
-    now = datetime.utcnow()
+    with _booking_write_lock:
+        start = parse_input_datetime(payload.start_time)
+        end = parse_input_datetime(payload.end_time)
 
-    # FIXED: Rule 2 - No grace window allowed. Must be strictly in the future.
-    if start <= now:
-        raise AppError(400, "INVALID_BOOKING_WINDOW", "start_time must be in the future")
+        # FIXED: Enforce real minute-level granularity and up to 24 hours max
+        duration = end - start
+        if duration < timedelta(minutes=1) or duration > timedelta(hours=24):
+            raise AppError(400, "INVALID_DURATION", "Duration must be between 1 minute and 24 hours.")
 
-    duration_hours = (end - start).total_seconds() / 3600
-    if duration_hours != int(duration_hours):
-        raise AppError(400, "INVALID_BOOKING_WINDOW", "duration must be a whole number of hours")
-    duration_hours = int(duration_hours)
-    
-    # FIXED: Rule 2 - Check both minimum and maximum limits
-    if duration_hours < MIN_DURATION_HOURS or duration_hours > MAX_DURATION_HOURS:
-        raise AppError(400, "INVALID_BOOKING_WINDOW", "duration out of range")
+        now = datetime.utcnow()
 
-    room = db.query(Room).filter(Room.id == payload.room_id, Room.org_id == user.org_id).first()
-    if room is None:
-        raise AppError(404, "ROOM_NOT_FOUND", "Room not found")
+        # start_time must be strictly in the future
+        if start <= now:
+            raise AppError(400, "INVALID_BOOKING_WINDOW", "start_time must be in the future")
 
-    if _has_conflict(db, room.id, start, end):
-        raise AppError(409, "ROOM_CONFLICT", "Room already booked for this interval")
+        room = db.query(Room).filter(Room.id == payload.room_id, Room.org_id == current_user.org_id).first()
+        if room is None:
+            raise AppError(404, "ROOM_NOT_FOUND", "Room not found")
 
-    _check_quota(db, user.id, now, start)
+        # FIXED: Conflict selection loop safely inside the critical section (Anti-TOCTOU)
+        has_clash = db.query(Booking).filter(
+            Booking.room_id == payload.room_id,
+            Booking.status != "cancelled",
+            Booking.start_time < end,
+            Booking.end_time > start
+        ).first()
+        if has_clash:
+            raise AppError(409, "ROOM_CONFLICT", "The selected room is occupied during this time frame.")
 
-    price_cents = room.hourly_rate_cents * duration_hours
-    booking = Booking(
-        room_id=room.id,
-        user_id=user.id,
-        start_time=start,
-        end_time=end,
-        status="confirmed",
-        reference_code=reference.next_reference_code(),
-        price_cents=price_cents,
-        created_at=now,
-    )
-    db.add(booking)
-    db.commit()
-    db.refresh(booking)
+        _check_quota(db, current_user.id, now, start)
 
-    stats.record_create(room.id, price_cents)
-    cache.invalidate_availability(room.id, start.date().isoformat())
-    notifications.notify_created(booking)
+        # Calculate price using hourly rate and duration (float hours, not integer)
+        duration_hours = duration.total_seconds() / 3600
+        price_cents = round(room.hourly_rate_cents * duration_hours)
 
-    return serialize_booking(booking)
+        booking = Booking(
+            room_id=room.id,
+            user_id=current_user.id,
+            start_time=start,
+            end_time=end,
+            status="confirmed",
+            reference_code=reference.next_reference_code(),
+            price_cents=price_cents,
+            created_at=now,
+        )
+        db.add(booking)
+        db.commit()
+        db.refresh(booking)
+
+        stats.record_create(room.id, price_cents)
+        # FIXED: Symmetric Cache Invalidation (Item #14)
+        cache.invalidate_availability(room.id, start.strftime("%Y-%m-%d"))
+        if start.date() != end.date():
+            cache.invalidate_availability(room.id, end.strftime("%Y-%m-%d"))
+        cache.invalidate_report(current_user.org_id)
+        notifications.notify_created(booking)
+
+        return serialize_booking(booking)
 
 
 @router.get("/bookings")
@@ -206,33 +220,19 @@ def cancel_booking(
     if booking.status == "cancelled":
         raise AppError(409, "ALREADY_CANCELLED", "Booking already cancelled")
 
-    now = datetime.utcnow()
-    notice = booking.start_time - now
-    
-    # FIXED: Rule 6 - Explicit calculation using timedelta intervals to prevent truncation anomalies
-    if notice > timedelta(hours=48):
-        refund_percent = 100
-    elif notice >= timedelta(hours=24):
-        refund_percent = 50
-    else:
-        refund_percent = 0
-
+    refund_percent = calculate_refund_tier(booking)
     refund_amount_cents = round(booking.price_cents * (refund_percent / 100.0))
 
-    # Calculate actual percentage log mapping
     log_refund(db, booking, refund_amount_cents)
 
-    _settlement_pause()
     booking.status = "cancelled"
     db.commit()
 
     stats.record_cancel(booking.room_id, booking.price_cents)
     cache.invalidate_report(user.org_id)
+    cache.invalidate_availability(booking.room_id, booking.start_time.strftime("%Y-%m-%d"))
+    if booking.start_time.date() != booking.end_time.date():
+        cache.invalidate_availability(booking.room_id, booking.end_time.strftime("%Y-%m-%d"))
     notifications.notify_cancelled(booking)
 
-    return {
-        "id": booking.id,
-        "status": "cancelled",
-        "refund_percent": refund_percent,
-        "refund_amount_cents": refund_amount_cents,
-    }
+    return {"status": "success", "refund_cents": refund_amount_cents}

@@ -1,22 +1,15 @@
-"""Refund bookkeeping.
-
-When a booking is cancelled a refund is calculated from its price and the
-applicable notice tier, then written to the refund ledger with a processed
-status. Amounts are stored in whole cents.
-"""
-from datetime import datetime
-
+"""Refund processing ledger tracking."""
+from datetime import datetime, timezone
 from sqlalchemy.orm import Session
-
-from ..models import Booking, RefundLog
-
+from ..models import RefundLog
 
 def log_refund(db: Session, booking, amount_cents: int) -> None:
-    # FIXED: Expect and store raw cents directly to eliminate percentage calculation division bugs
+    # FIXED: Replaced 'created_at' with 'processed_at' and populated 'status'
     refund_log = RefundLog(
         booking_id=booking.id,
         amount_cents=amount_cents,
-        created_at=datetime.utcnow()
+        status="processed",
+        processed_at=datetime.now(timezone.utc).replace(tzinfo=None)
     )
     db.add(refund_log)
-    db.commit()
+    # REMOVED db.commit() here to allow the caller to commit both operations atomically

@@ -22,14 +22,16 @@ def _write_audit(kind: str, booking) -> None:
 
 
 def notify_created(booking) -> None:
+    # FIXED: Execute locks independently to eliminate AB-BA deadlock potential
     with _email_lock:
         _send_email("created", booking)
-        with _audit_lock:
-            _write_audit("created", booking)
+    with _audit_lock:
+        _write_audit("created", booking)
 
 
 def notify_cancelled(booking) -> None:
+    # FIXED: Standardized flat non-nested order matching global resource locking
     with _audit_lock:
         _write_audit("cancelled", booking)
-        with _email_lock:
-            _send_email("cancelled", booking)
+    with _email_lock:
+        _send_email("cancelled", booking)
