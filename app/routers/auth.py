@@ -5,7 +5,7 @@ from sqlalchemy.orm import Session
 from ..auth import (
     create_access_token,
     create_refresh_token,
-    decode_token,
+    consume_refresh_token,
     get_token_payload,
     hash_password,
     revoke_access_token,
@@ -34,7 +34,6 @@ def register(payload: RegisterRequest, db: Session = Depends(get_db)):
         .filter(User.org_id == org.id, User.username == payload.username)
         .first()
     )
-    # FIXED: Rule 15 - Instead of letting a duplicate username bypass validation, raise a 409
     if existing is not None:
         raise AppError(409, "USERNAME_TAKEN", "Username is already taken within this organization")
 
@@ -76,16 +75,12 @@ def login(payload: LoginRequest, db: Session = Depends(get_db)):
 
 @router.post("/refresh")
 def refresh(payload: RefreshRequest, db: Session = Depends(get_db)):
-    data = decode_token(payload.refresh_token)
-    if data.get("type") != "refresh":
-        raise AppError(401, "UNAUTHORIZED", "Wrong token type")
-        
+    # Atomically decode + revoke the refresh token to prevent concurrent reuse
+    data = consume_refresh_token(payload.refresh_token)
+
     user = db.query(User).filter(User.id == int(data["sub"])).first()
     if user is None:
         raise AppError(401, "UNAUTHORIZED", "Unknown user")
-
-    # FIXED: Rule 8 - Enforce single-use refresh token constraints by revoking the used JTI
-    revoke_access_token(data)
 
     return {
         "access_token": create_access_token(user),

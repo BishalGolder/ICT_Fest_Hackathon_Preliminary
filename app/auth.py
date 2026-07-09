@@ -49,16 +49,16 @@ def verify_password(password: str, stored: str) -> bool:
 
 
 def create_access_token(user) -> str:
-    # FIXED: Removed the incorrect '* 60' multiplier that caused a 15-hour duration leak
     lifetime = timedelta(minutes=ACCESS_TOKEN_EXPIRE_MINUTES)
     now = datetime.now(timezone.utc)
     payload = {
         "sub": str(user.id),
         "org": user.org_id,
         "role": user.role,
-        "type": "access",
-        "exp": now + lifetime,
         "jti": str(uuid.uuid4()),
+        "iat": now,
+        "exp": now + lifetime,
+        "type": "access",
     }
     return jwt.encode(payload, JWT_SECRET, algorithm=JWT_ALGORITHM)
 
@@ -69,8 +69,10 @@ def create_refresh_token(user) -> str:
     payload = {
         "sub": str(user.id),
         "org": user.org_id,
-        "exp": now + lifetime,
+        "role": user.role,
         "jti": str(uuid.uuid4()),
+        "iat": now,
+        "exp": now + lifetime,
         "type": "refresh",
     }
     return jwt.encode(payload, JWT_SECRET, algorithm=JWT_ALGORITHM)
@@ -85,6 +87,28 @@ def decode_token(token: str) -> dict:
         return payload
     except jwt.PyJWTError:
         raise AppError(401, "UNAUTHORIZED", "Invalid or expired token")
+
+
+def consume_refresh_token(token: str) -> dict:
+    """
+    Atomically decode, validate, and revoke a refresh token.
+    This prevents concurrent reuse of the same refresh token.
+    """
+    try:
+        payload = jwt.decode(token, JWT_SECRET, algorithms=[JWT_ALGORITHM])
+    except jwt.PyJWTError:
+        raise AppError(401, "UNAUTHORIZED", "Invalid or expired token")
+
+    if payload.get("type") != "refresh":
+        raise AppError(401, "UNAUTHORIZED", "Wrong token type")
+
+    jti = payload.get("jti")
+    with _auth_lock:
+        if jti in _revoked_tokens:
+            raise AppError(401, "UNAUTHORIZED", "Token has been revoked")
+        _revoked_tokens.add(jti)
+
+    return payload
 
 
 def revoke_access_token(payload: dict) -> None:
