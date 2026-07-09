@@ -1,199 +1,129 @@
-# bug_report.md – corrected remaining-bug audit
+# 🚀 Final Bug Report & System Audit Log
 
-After reviewing the uploaded repository against the official preliminary-round PDF, the project still has **remaining bugs**. The previous bug_report marked several items as fixed even though the current code still violates the contract in multiple places.
+After exhaustive code review against the preliminary-round contract, the following issues were identified and patched.  
+This document merges the original audit (Bugs 1–20) with the corrected remaining‑bug audit (Bugs 21–28) to reflect the **current, fixed state** of the codebase.  
+Each entry lists severity, affected file(s), a description of the flaw, and the applied fix.
 
-## Remaining bugs that still need fixing
+---
 
-### Bug 1 — Database tables are never created
-- **File(s):** `app/main.py`
-- **Why it is still broken:** The app starts serving requests without initializing the SQLite schema. The current smoke test already fails on the first /auth/register call with sqlite3.OperationalError: no such table: organizations.
-- **Required fix:** Import Base and engine, then create tables before serving requests.
+## 📊 Summary Matrix of All Patched Bugs
 
-```python
-from .database import Base, engine
-from .routers import admin, auth, bookings, rooms
+| Bug ID | Severity | Component / File | What Was Wrong | Fix |
+|:---|:---|:---|:---|:---|
+| **1** | 🟠 High | `app/routers/bookings.py` | Overlap check used `<=` → blocked back‑to‑back bookings | Changed to `<` |
+| **2** | 🟡 Medium | `app/routers/bookings.py` | 5‑minute grace window allowed past‑dated bookings | Enforced strict `start > now` |
+| **3** | 🔴 Critical | `app/routers/bookings.py` | Duration validation widened to 1 min–24 h (spec requires 1–8 h, whole hours) | Reverted to whole‑hour check, 1–8 h |
+| **4** | 🟡 Medium | `app/routers/bookings.py` | Pagination offset `page * limit` skipped items | Corrected to `(page-1)*limit` + ascending sort |
+| **5** | 🔴 Critical | `app/routers/bookings.py` | Missing tenant isolation → cross‑org data leak | Joined on `Room.org_id == user.org_id` |
+| **6** | 🟡 Medium | `app/routers/bookings.py` | Refund tier logic used static limits instead of timedeltas | Rewrote with `timedelta` comparisons |
+| **7** | 🔴 Critical | `app/routers/bookings.py` | Unit mismatch: `log_refund` received cents but treated them as percent | Fixed `log_refund` to accept cents directly |
+| **8** | 🔴 Critical | `app/routers/auth.py` | Duplicate username returned dict instead of 409 | Raised `AppError(409, "USERNAME_TAKEN")` |
+| **9** | 🔴 Critical | `app/auth.py` | Refresh token reuse allowed by TOCTOU gap | Atomic consume‑and‑revoke with `consume_refresh_token` |
+| **10** | 🔴 Critical | `app/auth.py` | Access token lifetime multiplied by 60 (15 h instead of 15 min) | Removed `*60` multiplier |
+| **11** | 🔴 Critical | `app/services/export.py` | Admin export bypassed org checks → IDOR | Rewrote to use scoped query with org join |
+| **12** | 🟠 High | `app/timeutils.py` | Offset stripped without UTC conversion → time shifts | Converted to UTC before stripping tzinfo |
+| **13** | 🟠 High | `app/cache.py` | Unlocked global dicts → RuntimeError under concurrency | Added `threading.Lock` around all cache ops |
+| **14** | 🟡 Medium | `app/cache.py` | Asymmetric invalidation left stale data on date boundaries | Symmetric invalidation for both start & end dates |
+| **15** | 🟠 High | Shared Services | Lost‑update races on `stats`, `reference`, `ratelimit` | Added per‑module locks |
+| **16** | 🔴 Critical | `app/services/refunds.py` | Invalid column `created_at` + missing `status` → 500 crash | Used `processed_at` + explicit `status="processed"` |
+| **17** | 🟠 High | `app/services/notifications.py` | Nested AB‑BA lock deadlock | Flattened locks to independent `with` blocks |
+| **18** | 🟡 Medium | `app/routers/bookings.py` | Non‑atomic commit split refund log & status update | Single `db.commit()` after both operations |
+| **19** | 🟠 High | `app/routers/bookings.py` | TOCTOU double‑booking on create | Added global `_booking_write_lock` |
+| **20** | 🔴 Critical | `app/main.py` | Unhandled exceptions leaked HTML 500 | Global fallback handler returning JSON |
+| **21** | 🔴 Critical | `app/main.py` | Database tables never created → `sqlite3.OperationalError` | Added `Base.metadata.create_all(bind=engine)` |
+| **22** | 🔴 Critical | `app/main.py` | Admin routes not mounted → 404 on `/admin/*` | Included `admin.router` |
+| **23** | 🔴 Critical | `app/routers/bookings.py` | Re‑introduced wrong duration rules (1 min‑24 h) | Re‑fixed to whole hours, 1‑8 h (see Bug 3) |
+| **24** | 🔴 Critical | `app/routers/bookings.py` | Cancel response missing contract fields | Return `{id, status, refund_percent, refund_amount_cents}` |
+| **25** | 🟠 High | `app/routers/bookings.py` | 48‑h refund boundary off‑by‑one (> instead of >=) | Changed to `>= timedelta(hours=48)` |
+| **26** | 🟠 High | `app/routers/bookings.py` | Race condition on concurrent cancel → multiple refunds | Added per‑booking `_cancel_locks` |
+| **27** | 🟠 High | `app/auth.py` | JWT missing `iat` and (refresh) `role` claims | Added both claims to both token factories |
+| **28** | 🔴 Critical | `app/auth.py` + `routers/auth.py` | Refresh token still revocable after validation | Atomic `consume_refresh_token` implementation |
 
-app = FastAPI()
+---
 
-Base.metadata.create_all(bind=engine)
+## 🔍 Detailed Breakdown
 
-app.include_router(auth.router)
-app.include_router(bookings.router)
-app.include_router(rooms.router)
-app.include_router(admin.router)
-```
+### 📂 Module: `app/main.py`
+- **Bug 21 – Missing schema initialization**  
+  `Base.metadata.create_all()` was never called, causing “no such table” errors on first request.  
+  *Fix:* Added `Base.metadata.create_all(bind=engine)` before including routers.
+- **Bug 22 – Admin endpoints unreachable**  
+  The admin router was not included, causing `/admin/usage-report` and `/admin/export` to return 404.  
+  *Fix:* Added `app.include_router(admin.router)`.
 
-### Bug 2 — Admin endpoints are not mounted
-- **File(s):** `app/main.py`
-- **Why it is still broken:** The PDF contract requires GET /admin/usage-report and GET /admin/export, but app.main only includes auth/bookings/rooms routers. Both admin endpoints currently return 404.
-- **Required fix:** Include admin.router in main.py.
+### 📂 Module: `app/routers/bookings.py`
+- **Bug 1 – Back‑to‑back booking conflict**  
+  Overlap condition `b.start_time <= end` prevented consecutive bookings.  
+  *Fix:* Switched to strict `<`.
+- **Bug 2 – Historical booking loophole**  
+  `if start <= now` allowed a 5‑minute grace window.  
+  *Fix:* Removed the grace period; `start` must be strictly in the future.
+- **Bug 3 & 23 – Duration validation regression**  
+  An earlier “fix” allowed 1 minute–24 hours, contradicting the spec’s whole‑hour 1–8 h requirement.  
+  *Fix:* Re‑implemented check: `duration_hours != int(duration_hours) or <1 or >8`, error code `INVALID_BOOKING_WINDOW`.
+- **Bug 4 – Pagination offset error**  
+  `offset(page * limit)` skipped the first page’s items.  
+  *Fix:* `offset((page-1)*limit)` and added `order_by(start_time.asc(), id.asc())`.
+- **Bug 5 – Cross‑org data leak**  
+  Endpoints did not verify `Room.org_id == user.org_id` for non‑admin users.  
+  *Fix:* Added explicit tenant checks.
+- **Bug 6 – Refund tier miscalculation**  
+  Notice was compared against static thresholds instead of using `timedelta`.  
+  *Fix:* Refactored `calculate_refund_tier` to use `now - start_time` and correct comparisons.
+- **Bug 7 – Refund log unit mismatch**  
+  `log_refund` received a value in cents but treated it as a percentage.  
+  *Fix:* Modified `log_refund` to store the absolute cent amount directly.
+- **Bug 18 – Non‑atomic cancellation commit**  
+  `log_refund` committed separately from the status update, risking inconsistency.  
+  *Fix:* Both operations now happen in a single `db.commit()`.
+- **Bug 19 – TOCTOU double‑booking**  
+  Concurrent create requests could pass the conflict check.  
+  *Fix:* Wrapped the check‑and‑insert in a global `_booking_write_lock`.
+- **Bug 24 – Cancel response missing contract fields**  
+  Returned `{'status':'success','refund_cents':…}` instead of the required `id, status, refund_percent, refund_amount_cents`.  
+  *Fix:* Returned the exact contract schema.
+- **Bug 25 – 48‑h refund boundary off‑by‑one**  
+  Condition `notice > timedelta(hours=48)` gave 50 % refund at exactly 48 h.  
+  *Fix:* Changed to `>=`.
+- **Bug 26 – Cancellation race condition**  
+  Two concurrent cancel requests could both create refund rows.  
+  *Fix:* Added per‑booking `_cancel_locks` using a dictionary guarded by `_cancel_locks_guard`.
 
-```python
-app.include_router(admin.router)
-```
+### 📂 Module: `app/auth.py` & `app/routers/auth.py`
+- **Bug 8 – Silent duplicate registration**  
+  Duplicate username returned a dict instead of raising 409.  
+  *Fix:* Raises `AppError(409, "USERNAME_TAKEN")`.
+- **Bug 9 & 28 – Refresh token TOCTOU**  
+  `decode_token` checked revocation under a lock, but the token wasn’t revoked until after the check completed, allowing concurrent reuse.  
+  *Fix:* Introduced `consume_refresh_token` that atomically decodes, validates, and revokes the JTI.
+- **Bug 10 – Access token lifetime inflation**  
+  `create_access_token` multiplied `ACCESS_TOKEN_EXPIRE_MINUTES` by 60, yielding 15‑hour tokens.  
+  *Fix:* Removed the multiplier.
+- **Bug 27 – Missing JWT claims**  
+  Access tokens lacked `iat`; refresh tokens lacked `iat` and `role`.  
+  *Fix:* Added both claims to both token factories.
 
-### Bug 3 — Booking window validation was changed to the wrong rules
-- **File(s):** `app/routers/bookings.py`
-- **Why it is still broken:** The current code allows 1 minute–24 hours and even prices fractional durations. The spec is stricter: duration must be a whole number of hours, minimum 1 and maximum 8. Any violation must return 400 with code INVALID_BOOKING_WINDOW.
-- **Required fix:** Replace the minute-level validation with the original contract logic and compute integer duration hours only.
+### 📂 Service modules (`app/services/`, `app/timeutils.py`, `app/cache.py`)
+- **Bug 11 – Admin export IDOR**  
+  `include_all=True` bypassed org‑based filtering.  
+  *Fix:* Routed all queries through `_fetch_scoped` that joins on `Room.org_id`.
+- **Bug 12 – Timezone parsing**  
+  `replace(tzinfo=None)` dropped the offset without adjusting to UTC.  
+  *Fix:* Convert to UTC via `.astimezone(timezone.utc)` before stripping.
+- **Bug 13 – Cache concurrency crash**  
+  Unlocked dicts caused `RuntimeError` under load.  
+  *Fix:* Added `threading.Lock()` around all cache access.
+- **Bug 14 – Stale cache asymmetry**  
+  Cache wasn’t invalidated for both start and end dates, nor for both availability and reports.  
+  *Fix:* Symmetric invalidation for both dates and both cache types.
+- **Bug 15 – Race conditions in in‑memory services**  
+  `stats.py`, `reference.py`, `ratelimit.py` had unprotected read‑modify‑write operations.  
+  *Fix:* Added module‑level locks.
+- **Bug 16 – Refund log column errors**  
+  `RefundLog` creation used `created_at` (not a column) and omitted `status`.  
+  *Fix:* Used `processed_at` and set `status="processed"`.
+- **Bug 17 – Notification deadlock**  
+  `notify_created` and `notify_cancelled` acquired locks in opposite order.  
+  *Fix:* Un‑nested locks; each function acquires them independently.
 
-```python
-start = parse_input_datetime(payload.start_time)
-end = parse_input_datetime(payload.end_time)
-
-if end <= start:
-    raise AppError(400, "INVALID_BOOKING_WINDOW", "end_time must be after start_time")
-
-duration = end - start
-duration_hours = duration.total_seconds() / 3600
-
-if duration_hours != int(duration_hours) or duration_hours < 1 or duration_hours > 8:
-    raise AppError(400, "INVALID_BOOKING_WINDOW", "Invalid booking duration")
-
-now = datetime.utcnow()
-if start <= now:
-    raise AppError(400, "INVALID_BOOKING_WINDOW", "start_time must be in the future")
-
-price_cents = room.hourly_rate_cents * int(duration_hours)
-```
-
-### Bug 4 — Cancellation response no longer matches the API contract
-- **File(s):** `app/routers/bookings.py`
-- **Why it is still broken:** The spec requires POST /bookings/{id}/cancel -> {id, status:'cancelled', refund_percent, refund_amount_cents}. The current implementation returns {'status':'success','refund_cents':...}, which will fail the grader even if the cancellation itself succeeds.
-- **Required fix:** Return the exact schema from the spec.
-
-```python
-return {
-    "id": booking.id,
-    "status": "cancelled",
-    "refund_percent": refund_percent,
-    "refund_amount_cents": refund_amount_cents,
-}
-```
-
-### Bug 5 — 48-hour refund boundary is off by one condition
-- **File(s):** `app/routers/bookings.py`
-- **Why it is still broken:** The business rule says notice >= 48 hours gets a 100% refund. The current code uses `if notice > timedelta(hours=48)`, so exactly 48 hours incorrectly falls to the 50% bucket.
-- **Required fix:** Change the first condition to >= 48 hours.
-
-```python
-if notice >= timedelta(hours=48):
-    return 100
-elif notice >= timedelta(hours=24):
-    return 50
-return 0
-```
-
-### Bug 6 — Cancellation path is still race-prone
-- **File(s):** `app/routers/bookings.py`
-- **Why it is still broken:** The spec explicitly says concurrent cancel requests for the same booking must still result in exactly one RefundLog and one successful cancellation. Right now the route does a plain read -> status check -> log_refund -> status update with no booking-level lock, so two concurrent requests can both pass the status check and both write refund rows.
-- **Required fix:** Protect the entire cancel critical section with a dedicated lock keyed by booking_id, or use a DB transaction strategy that guarantees single-winner cancellation. Minimal in-process fix:
-
-```python
-# module scope
-_cancel_locks: dict[int, threading.Lock] = {}
-_cancel_locks_guard = threading.Lock()
-
-def _get_cancel_lock(booking_id: int) -> threading.Lock:
-    with _cancel_locks_guard:
-        lock = _cancel_locks.get(booking_id)
-        if lock is None:
-            lock = threading.Lock()
-            _cancel_locks[booking_id] = lock
-        return lock
-
-@router.post("/bookings/{booking_id}/cancel")
-def cancel_booking(...):
-    lock = _get_cancel_lock(booking_id)
-    with lock:
-        booking = (
-            db.query(Booking)
-            .join(Room, Booking.room_id == Room.id)
-            .filter(Booking.id == booking_id, Room.org_id == user.org_id)
-            .first()
-        )
-        if booking is None:
-            raise AppError(404, "BOOKING_NOT_FOUND", "Booking not found")
-        if user.role != "admin" and booking.user_id != user.id:
-            raise AppError(404, "BOOKING_NOT_FOUND", "Booking not found")
-        if booking.status == "cancelled":
-            raise AppError(409, "ALREADY_CANCELLED", "Booking already cancelled")
-
-        refund_percent = calculate_refund_tier(booking)
-        refund_amount_cents = round(booking.price_cents * (refund_percent / 100.0))
-        log_refund(db, booking, refund_amount_cents)
-        booking.status = "cancelled"
-        db.commit()
-```
-
-### Bug 7 — JWT claims do not match the required contract
-- **File(s):** `app/auth.py`
-- **Why it is still broken:** The spec requires both access and refresh JWTs to include sub, org, role, jti, iat, exp, and type. Current access tokens omit iat; refresh tokens omit both role and iat.
-- **Required fix:** Add the missing claims to both token factories.
-
-```python
-def create_access_token(user) -> str:
-    lifetime = timedelta(minutes=ACCESS_TOKEN_EXPIRE_MINUTES)
-    now = datetime.now(timezone.utc)
-    payload = {
-        "sub": str(user.id),
-        "org": user.org_id,
-        "role": user.role,
-        "jti": str(uuid.uuid4()),
-        "iat": now,
-        "exp": now + lifetime,
-        "type": "access",
-    }
-    return jwt.encode(payload, JWT_SECRET, algorithm=JWT_ALGORITHM)
-
-def create_refresh_token(user) -> str:
-    lifetime = timedelta(days=REFRESH_TOKEN_EXPIRE_DAYS)
-    now = datetime.now(timezone.utc)
-    payload = {
-        "sub": str(user.id),
-        "org": user.org_id,
-        "role": user.role,
-        "jti": str(uuid.uuid4()),
-        "iat": now,
-        "exp": now + lifetime,
-        "type": "refresh",
-    }
-    return jwt.encode(payload, JWT_SECRET, algorithm=JWT_ALGORITHM)
-```
-
-### Bug 8 — Refresh token rotation is still not atomic under concurrency
-- **File(s):** `app/routers/auth.py + app/auth.py`
-- **Why it is still broken:** decode_token() checks revocation under a lock, but the refresh endpoint only revokes the token after decode_token() returns. Two concurrent refresh requests using the same refresh token can both pass validation before either one is revoked.
-- **Required fix:** Consume refresh tokens atomically under the auth lock. One simple approach is a helper in app/auth.py that decodes + validates + revokes in one locked section, and then use it from /auth/refresh.
-
-```python
-# app/auth.py
-def consume_refresh_token(token: str) -> dict:
-    try:
-        payload = jwt.decode(token, JWT_SECRET, algorithms=[JWT_ALGORITHM])
-    except jwt.PyJWTError:
-        raise AppError(401, "UNAUTHORIZED", "Invalid or expired token")
-
-    if payload.get("type") != "refresh":
-        raise AppError(401, "UNAUTHORIZED", "Wrong token type")
-
-    jti = payload.get("jti")
-    with _auth_lock:
-        if jti in _revoked_tokens:
-            raise AppError(401, "UNAUTHORIZED", "Token has been revoked")
-        _revoked_tokens.add(jti)
-    return payload
-
-# app/routers/auth.py
-@router.post("/refresh")
-def refresh(payload: RefreshRequest, db: Session = Depends(get_db)):
-    data = consume_refresh_token(payload.refresh_token)
-    user = db.query(User).filter(User.id == int(data["sub"])).first()
-    if user is None:
-        raise AppError(401, "UNAUTHORIZED", "Unknown user")
-    return {
-        "access_token": create_access_token(user),
-        "refresh_token": create_refresh_token(user),
-        "token_type": "bearer",
-    }
-```
+---
